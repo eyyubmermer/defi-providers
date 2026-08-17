@@ -1,8 +1,13 @@
 import { ITvlParams, ITvlReturn } from '../../../../interfaces/ITvl';
 import formatter from '../../../../util/formatter';
 import uniswapV3 from '../../../../util/calculators/uniswapV3chain';
+import thanosVault, {
+  CL_INITIALIZE_TOPIC,
+  BIN_INITIALIZE_TOPIC,
+} from '../../../../util/calculators/thanosVault';
 import BigNumber from 'bignumber.js';
 import { request, gql } from 'graphql-request';
+import CONSTANTS from '../../../../constants/contracts.json';
 
 // Constants for original versions
 const V2_START_BLOCK = 34130751;
@@ -15,6 +20,14 @@ const DYNAMO_START_BLOCK = 46188894;
 const WOW_START_BLOCK = 46190543;
 const WOW_FACTORY_ADDRESS = '0x10d8612D9D8269e322AB551C18a307cB4D6BC07B';
 const DYNAMO_SUBGRAPH_ENDPOINT = `https://api.studio.thegraph.com/query/76181/exchangev2-wd/version/latest`;
+
+// Constants for Thanos (V4)
+const THANOS_START_BLOCK = 74380131;
+const THANOS_VAULT_ADDRESS = '0x3754bd79d88e89f397ed1bffad8cdf3e0fdcc37e';
+const THANOS_CL_POOL_MANAGER_ADDRESS =
+  '0x9d3b119eff69cd81d324f654062b6ffa3dd7f405';
+const THANOS_BIN_POOL_MANAGER_ADDRESS =
+  '0xd7a5a9df1719ee83a4d10749019caabf137debac';
 
 const QUERY_SIZE = 1000;
 const TOKENS = gql`
@@ -103,12 +116,41 @@ async function tvl(params: ITvlParams): Promise<Partial<ITvlReturn>> {
     );
   }
 
+  // Thanos (V4) balances, all pool funds are held by a single Vault
+  let balancesThanos = {};
+  if (block >= THANOS_START_BLOCK) {
+    balancesThanos = await thanosVault.getTvl(
+      THANOS_VAULT_ADDRESS,
+      [
+        { address: THANOS_CL_POOL_MANAGER_ADDRESS, topic: CL_INITIALIZE_TOPIC },
+        {
+          address: THANOS_BIN_POOL_MANAGER_ADDRESS,
+          topic: BIN_INITIALIZE_TOPIC,
+        },
+      ],
+      THANOS_START_BLOCK,
+      block,
+      chain,
+      provider,
+      web3,
+    );
+
+    // Thanos pools use the zero address for the native token
+    const bnbBalance = await web3.eth.getBalance(THANOS_VAULT_ADDRESS, block);
+    balancesThanos[CONSTANTS.WMAIN_ADDRESS.bsc] = BigNumber(
+      balancesThanos[CONSTANTS.WMAIN_ADDRESS.bsc] || 0,
+    )
+      .plus(bnbBalance)
+      .toFixed();
+  }
+
   // Combine all balances
   const balances = formatter.sum([
     balancesV2,
     balancesV3,
     balancesDynamo,
     balancesWow,
+    balancesThanos,
   ]);
 
   return { balances };
