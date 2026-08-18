@@ -1,6 +1,8 @@
 import { ITvlParams, ITvlReturn } from '../../../../interfaces/ITvl';
 import formatter from '../../../../util/formatter';
 import uniswapV3 from '../../../../util/calculators/uniswapV3chain';
+import uniswapV2Subgraph from '../../../../util/calculators/uniswapV2';
+import squadswapVolumes from '../../../../util/calculators/squadswapVolumes';
 import thanosVault, {
   CL_INITIALIZE_TOPIC,
   BIN_INITIALIZE_TOPIC,
@@ -8,6 +10,8 @@ import thanosVault, {
 import BigNumber from 'bignumber.js';
 import { request, gql } from 'graphql-request';
 import CONSTANTS from '../../../../constants/contracts.json';
+
+const THE_GRAPH_API_KEY = process.env?.THE_GRAPH_API_KEY;
 
 // Constants for original versions
 const V2_START_BLOCK = 34130751;
@@ -19,7 +23,8 @@ const V2_SUBGRAPH_ENDPOINT = `https://api.studio.thegraph.com/query/76181/exchan
 const DYNAMO_START_BLOCK = 46188894;
 const WOW_START_BLOCK = 46190543;
 const WOW_FACTORY_ADDRESS = '0x10d8612D9D8269e322AB551C18a307cB4D6BC07B';
-const DYNAMO_SUBGRAPH_ENDPOINT = `https://api.studio.thegraph.com/query/76181/exchangev2-wd/version/latest`;
+const DYNAMO_SUBGRAPH_ENDPOINT = `https://gateway.thegraph.com/api/${THE_GRAPH_API_KEY}/subgraphs/id/C9FE68cq1GXDiR1qghTQRaH5wVs5S5y4qwqd7cSEZ3Ur`;
+const WOW_SUBGRAPH_ENDPOINT = `https://gateway.thegraph.com/api/${THE_GRAPH_API_KEY}/subgraphs/id/BgxeY5c3MiwAt4ahqiSq13eKWMGz9ax7dCgwxE7T7Nyn`;
 
 // Constants for Thanos (V4)
 const THANOS_START_BLOCK = 74380131;
@@ -28,6 +33,8 @@ const THANOS_CL_POOL_MANAGER_ADDRESS =
   '0x9d3b119eff69cd81d324f654062b6ffa3dd7f405';
 const THANOS_BIN_POOL_MANAGER_ADDRESS =
   '0xd7a5a9df1719ee83a4d10749019caabf137debac';
+const THANOS_SUBGRAPH_ENDPOINT =
+  'https://api.subgraph.ormilabs.com/api/public/46e5cb0d-fad2-4ba7-8fa5-9bd207380e15/subgraphs/squadswap-thns-v2-bsc/thns-bsc/gn';
 
 const QUERY_SIZE = 1000;
 const TOKENS = gql`
@@ -156,4 +163,81 @@ async function tvl(params: ITvlParams): Promise<Partial<ITvlReturn>> {
   return { balances };
 }
 
-export { tvl };
+/**
+ * Volumes are served by a separate subgraph per version, so each of them is
+ * queried and the results are merged. Pool ids never overlap between versions,
+ * while token volumes of the same token are summed up.
+ */
+async function getPoolVolumes(params) {
+  const { pools, block } = params;
+
+  const [dynamoVolumes, wowVolumes, thanosVolumes] = await Promise.all([
+    uniswapV2Subgraph.getPoolVolumes(
+      DYNAMO_SUBGRAPH_ENDPOINT,
+      QUERY_SIZE,
+      pools,
+      block,
+      null,
+    ),
+    squadswapVolumes.getV3PoolVolumes(
+      WOW_SUBGRAPH_ENDPOINT,
+      QUERY_SIZE,
+      pools,
+      block,
+    ),
+    squadswapVolumes.getThanosPoolVolumes(
+      THANOS_SUBGRAPH_ENDPOINT,
+      QUERY_SIZE,
+      pools,
+      block,
+    ),
+  ]);
+
+  return { ...dynamoVolumes, ...wowVolumes, ...thanosVolumes };
+}
+
+async function getTokenVolumes(params) {
+  const { tokens, block } = params;
+
+  const [dynamoVolumes, wowVolumes, thanosVolumes] = await Promise.all([
+    uniswapV2Subgraph.getTokenVolumes(
+      DYNAMO_SUBGRAPH_ENDPOINT,
+      QUERY_SIZE,
+      tokens,
+      block,
+      {
+        volume: 'tradeVolume',
+        volumeUsd: 'tradeVolumeUSD',
+      },
+    ),
+    squadswapVolumes.getTokenVolumes(
+      WOW_SUBGRAPH_ENDPOINT,
+      QUERY_SIZE,
+      tokens,
+      block,
+    ),
+    squadswapVolumes.getTokenVolumes(
+      THANOS_SUBGRAPH_ENDPOINT,
+      QUERY_SIZE,
+      tokens,
+      block,
+    ),
+  ]);
+
+  const tokenVolumes = {};
+  for (const versionVolumes of [dynamoVolumes, wowVolumes, thanosVolumes]) {
+    for (const [token, tokenVolume] of Object.entries(versionVolumes)) {
+      if (!tokenVolumes[token]) {
+        tokenVolumes[token] = { volume: BigNumber(0), volumeUsd: BigNumber(0) };
+      }
+      tokenVolumes[token] = {
+        volume: tokenVolumes[token].volume.plus(tokenVolume.volume),
+        volumeUsd: tokenVolumes[token].volumeUsd.plus(tokenVolume.volumeUsd),
+      };
+    }
+  }
+
+  return tokenVolumes;
+}
+
+export { tvl, getPoolVolumes, getTokenVolumes };
